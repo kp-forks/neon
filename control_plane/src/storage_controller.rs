@@ -5,8 +5,9 @@ use crate::{
 use camino::{Utf8Path, Utf8PathBuf};
 use pageserver_api::{
     controller_api::{
-        NodeConfigureRequest, NodeRegisterRequest, TenantCreateRequest, TenantCreateResponse,
-        TenantLocateResponse, TenantShardMigrateRequest, TenantShardMigrateResponse,
+        NodeConfigureRequest, NodeDescribeResponse, NodeRegisterRequest, TenantCreateRequest,
+        TenantCreateResponse, TenantLocateResponse, TenantShardMigrateRequest,
+        TenantShardMigrateResponse,
     },
     models::{
         TenantShardSplitRequest, TenantShardSplitResponse, TimelineCreateRequest, TimelineInfo,
@@ -29,7 +30,6 @@ use utils::{
 pub struct StorageController {
     env: LocalEnv,
     listen: String,
-    path: Utf8PathBuf,
     private_key: Option<Vec<u8>>,
     public_key: Option<String>,
     postgres_port: u16,
@@ -40,6 +40,8 @@ pub struct StorageController {
 const COMMAND: &str = "storage_controller";
 
 const STORAGE_CONTROLLER_POSTGRES_VERSION: u32 = 16;
+
+const DB_NAME: &str = "storage_controller";
 
 #[derive(Serialize, Deserialize)]
 pub struct AttachHookRequest {
@@ -65,10 +67,6 @@ pub struct InspectResponse {
 
 impl StorageController {
     pub fn from_env(env: &LocalEnv) -> Self {
-        let path = Utf8PathBuf::from_path_buf(env.base_data_dir.clone())
-            .unwrap()
-            .join("attachments.json");
-
         // Makes no sense to construct this if pageservers aren't going to use it: assume
         // pageservers have control plane API set
         let listen_url = env.control_plane_api.clone().unwrap();
@@ -128,7 +126,6 @@ impl StorageController {
 
         Self {
             env: env.clone(),
-            path,
             listen,
             private_key,
             public_key,
@@ -155,16 +152,16 @@ impl StorageController {
         .expect("non-Unicode path")
     }
 
-    /// Find the directory containing postgres binaries, such as `initdb` and `pg_ctl`
+    /// Find the directory containing postgres subdirectories, such `bin` and `lib`
     ///
     /// This usually uses STORAGE_CONTROLLER_POSTGRES_VERSION of postgres, but will fall back
     /// to other versions if that one isn't found.  Some automated tests create circumstances
     /// where only one version is available in pg_distrib_dir, such as `test_remote_extensions`.
-    pub async fn get_pg_bin_dir(&self) -> anyhow::Result<Utf8PathBuf> {
+    async fn get_pg_dir(&self, dir_name: &str) -> anyhow::Result<Utf8PathBuf> {
         let prefer_versions = [STORAGE_CONTROLLER_POSTGRES_VERSION, 15, 14];
 
         for v in prefer_versions {
-            let path = Utf8PathBuf::from_path_buf(self.env.pg_bin_dir(v)?).unwrap();
+            let path = Utf8PathBuf::from_path_buf(self.env.pg_dir(v, dir_name)?).unwrap();
             if tokio::fs::try_exists(&path).await? {
                 return Ok(path);
             }
@@ -172,9 +169,18 @@ impl StorageController {
 
         // Fall through
         anyhow::bail!(
-            "Postgres binaries not found in {}",
-            self.env.pg_distrib_dir.display()
+            "Postgres directory '{}' not found in {}",
+            dir_name,
+            self.env.pg_distrib_dir.display(),
         );
+    }
+
+    pub async fn get_pg_bin_dir(&self) -> anyhow::Result<Utf8PathBuf> {
+        self.get_pg_dir("bin").await
+    }
+
+    pub async fn get_pg_lib_dir(&self) -> anyhow::Result<Utf8PathBuf> {
+        self.get_pg_dir("lib").await
     }
 
     /// Readiness check for our postgres process
@@ -194,7 +200,6 @@ impl StorageController {
     ///
     /// Returns the database url
     pub async fn setup_database(&self) -> anyhow::Result<String> {
-        const DB_NAME: &str = "storage_controller";
         let database_url = format!("postgresql://localhost:{}/{DB_NAME}", self.postgres_port);
 
         let pg_bin_dir = self.get_pg_bin_dir().await?;
@@ -223,18 +228,47 @@ impl StorageController {
         Ok(database_url)
     }
 
+    pub async fn connect_to_database(
+        &self,
+    ) -> anyhow::Result<(
+        tokio_postgres::Client,
+        tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+    )> {
+        tokio_postgres::Config::new()
+            .host("localhost")
+            .port(self.postgres_port)
+            // The user is the ambient operating system user name.
+            // That is an impurity which we want to fix in => TODO https://github.com/neondatabase/neon/issues/8400
+            //
+            // Until we get there, use the ambient operating system user name.
+            // Recent tokio-postgres versions default to this if the user isn't specified.
+            // But tokio-postgres fork doesn't have this upstream commit:
+            // https://github.com/sfackler/rust-postgres/commit/cb609be758f3fb5af537f04b584a2ee0cebd5e79
+            // => we should rebase our fork => TODO https://github.com/neondatabase/neon/issues/8399
+            .user(&whoami::username())
+            .dbname(DB_NAME)
+            .connect(tokio_postgres::NoTls)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
     pub async fn start(&self, retry_timeout: &Duration) -> anyhow::Result<()> {
         // Start a vanilla Postgres process used by the storage controller for persistence.
         let pg_data_path = Utf8PathBuf::from_path_buf(self.env.base_data_dir.clone())
             .unwrap()
             .join("storage_controller_db");
         let pg_bin_dir = self.get_pg_bin_dir().await?;
+        let pg_lib_dir = self.get_pg_lib_dir().await?;
         let pg_log_path = pg_data_path.join("postgres.log");
 
         if !tokio::fs::try_exists(&pg_data_path).await? {
             // Initialize empty database
             let initdb_path = pg_bin_dir.join("initdb");
             let mut child = Command::new(&initdb_path)
+                .envs(vec![
+                    ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+                    ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+                ])
                 .args(["-D", pg_data_path.as_ref()])
                 .spawn()
                 .expect("Failed to spawn initdb");
@@ -242,17 +276,20 @@ impl StorageController {
             if !status.success() {
                 anyhow::bail!("initdb failed with status {status}");
             }
-
-            // Write a minimal config file:
-            // - Specify the port, since this is chosen dynamically
-            // - Switch off fsync, since we're running on lightweight test environments and when e.g. scale testing
-            //   the storage controller we don't want a slow local disk to interfere with that.
-            tokio::fs::write(
-                &pg_data_path.join("postgresql.conf"),
-                format!("port = {}\nfsync=off\n", self.postgres_port),
-            )
-            .await?;
         };
+
+        // Write a minimal config file:
+        // - Specify the port, since this is chosen dynamically
+        // - Switch off fsync, since we're running on lightweight test environments and when e.g. scale testing
+        //   the storage controller we don't want a slow local disk to interfere with that.
+        //
+        // NB: it's important that we rewrite this file on each start command so we propagate changes
+        // from `LocalEnv`'s config file (`.neon/config`).
+        tokio::fs::write(
+            &pg_data_path.join("postgresql.conf"),
+            format!("port = {}\nfsync=off\n", self.postgres_port),
+        )
+        .await?;
 
         println!("Starting storage controller database...");
         let db_start_args = [
@@ -269,7 +306,10 @@ impl StorageController {
             &self.env.base_data_dir,
             pg_bin_dir.join("pg_ctl").as_std_path(),
             db_start_args,
-            [],
+            vec![
+                ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+                ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+            ],
             background_process::InitialPidFile::Create(self.postgres_pid_file()),
             retry_timeout,
             || self.pg_isready(&pg_bin_dir),
@@ -279,16 +319,45 @@ impl StorageController {
         // Run migrations on every startup, in case something changed.
         let database_url = self.setup_database().await?;
 
+        // We support running a startup SQL script to fiddle with the database before we launch storcon.
+        // This is used by the test suite.
+        let startup_script_path = self
+            .env
+            .base_data_dir
+            .join("storage_controller_db.startup.sql");
+        let startup_script = match tokio::fs::read_to_string(&startup_script_path).await {
+            Ok(script) => {
+                tokio::fs::remove_file(startup_script_path).await?;
+                script
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // always run some startup script so that this code path doesn't bit rot
+                    "BEGIN; COMMIT;".to_string()
+                } else {
+                    anyhow::bail!("Failed to read startup script: {e}")
+                }
+            }
+        };
+        let (mut client, conn) = self.connect_to_database().await?;
+        let conn = tokio::spawn(conn);
+        let tx = client.build_transaction();
+        let tx = tx.start().await?;
+        tx.batch_execute(&startup_script).await?;
+        tx.commit().await?;
+        drop(client);
+        conn.await??;
+
         let mut args = vec![
             "-l",
             &self.listen,
-            "-p",
-            self.path.as_ref(),
             "--dev",
             "--database-url",
             &database_url,
-            "--max-unavailable-interval",
-            &humantime::Duration::from(self.config.max_unavailable).to_string(),
+            "--max-offline-interval",
+            &humantime::Duration::from(self.config.max_offline).to_string(),
+            "--max-warming-up-interval",
+            &humantime::Duration::from(self.config.max_warming_up).to_string(),
         ]
         .into_iter()
         .map(|s| s.to_string())
@@ -314,6 +383,10 @@ impl StorageController {
             args.push(format!("--split-threshold={split_threshold}"))
         }
 
+        if let Some(lag) = self.config.max_secondary_lag_bytes.as_ref() {
+            args.push(format!("--max-secondary-lag-bytes={lag}"))
+        }
+
         args.push(format!(
             "--neon-local-repo-dir={}",
             self.env.base_data_dir.display()
@@ -324,7 +397,10 @@ impl StorageController {
             &self.env.base_data_dir,
             &self.env.storage_controller_bin(),
             args,
-            [],
+            vec![
+                ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+                ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
+            ],
             background_process::InitialPidFile::Create(self.pid_file()),
             retry_timeout,
             || async {
@@ -552,6 +628,15 @@ impl StorageController {
             Method::PUT,
             format!("control/v1/node/{}/config", req.node_id),
             Some(req),
+        )
+        .await
+    }
+
+    pub async fn node_list(&self) -> anyhow::Result<Vec<NodeDescribeResponse>> {
+        self.dispatch::<(), Vec<NodeDescribeResponse>>(
+            Method::GET,
+            "control/v1/node".to_string(),
+            None,
         )
         .await
     }

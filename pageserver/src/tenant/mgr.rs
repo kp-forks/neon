@@ -13,7 +13,7 @@ use pageserver_api::upcall_api::ReAttachResponseTenant;
 use rand::{distributions::Alphanumeric, Rng};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,14 +36,15 @@ use crate::control_plane_client::{
 use crate::deletion_queue::DeletionQueueClient;
 use crate::http::routes::ACTIVE_TENANT_TIMEOUT;
 use crate::metrics::{TENANT, TENANT_MANAGER as METRICS};
-use crate::task_mgr::{self, TaskKind};
+use crate::task_mgr::{TaskKind, BACKGROUND_RUNTIME};
 use crate::tenant::config::{
     AttachedLocationConfig, AttachmentMode, LocationConf, LocationMode, SecondaryLocationConfig,
 };
 use crate::tenant::span::debug_assert_current_span_has_tenant_id;
 use crate::tenant::storage_layer::inmemory_layer;
 use crate::tenant::timeline::ShutdownMode;
-use crate::tenant::{AttachedTenantConf, GcError, SpawnMode, Tenant, TenantState};
+use crate::tenant::{AttachedTenantConf, GcError, LoadConfigError, SpawnMode, Tenant, TenantState};
+use crate::virtual_file::MaybeFatalIo;
 use crate::{InitializationOrder, TEMP_FILE_SUFFIX};
 
 use utils::crashsafe::path_with_suffix_extension;
@@ -54,7 +55,7 @@ use utils::id::{TenantId, TimelineId};
 use super::remote_timeline_client::remote_tenant_path;
 use super::secondary::SecondaryTenant;
 use super::timeline::detach_ancestor::PreparedTimelineDetach;
-use super::TenantSharedResources;
+use super::{GlobalShutDown, TenantSharedResources};
 
 /// For a tenant that appears in TenantsMap, it may either be
 /// - `Attached`: has a full Tenant object, is elegible to service
@@ -115,8 +116,6 @@ pub(crate) enum ShardSelector {
     /// Only return the 0th shard, if it is present.  If a non-0th shard is present,
     /// ignore it.
     Zero,
-    /// Pick the first shard we find for the TenantId
-    First,
     /// Pick the shard that holds this key
     Page(Key),
     /// The shard ID is known: pick the given shard
@@ -224,26 +223,60 @@ async fn safe_rename_tenant_dir(path: impl AsRef<Utf8Path>) -> std::io::Result<U
     Ok(tmp_path)
 }
 
-/// When we have moved a tenant's content to a temporary directory, we may delete it lazily in
-/// the background, and thereby avoid blocking any API requests on this deletion completing.
-fn spawn_background_purge(tmp_path: Utf8PathBuf) {
-    // Although we are cleaning up the tenant, this task is not meant to be bound by the lifetime of the tenant in memory.
-    // After a tenant is detached, there are no more task_mgr tasks for that tenant_id.
-    let task_tenant_id = None;
+/// See [`Self::spawn`].
+#[derive(Clone, Default)]
+pub struct BackgroundPurges(tokio_util::task::TaskTracker);
 
-    task_mgr::spawn(
-        task_mgr::BACKGROUND_RUNTIME.handle(),
-        TaskKind::MgmtRequest,
-        task_tenant_id,
-        None,
-        "tenant_files_delete",
-        false,
-        async move {
-            fs::remove_dir_all(tmp_path.as_path())
-                .await
-                .with_context(|| format!("tenant directory {:?} deletion", tmp_path))
-        },
-    );
+impl BackgroundPurges {
+    /// When we have moved a tenant's content to a temporary directory, we may delete it lazily in
+    /// the background, and thereby avoid blocking any API requests on this deletion completing.
+    ///
+    /// Although we are cleaning up the tenant, this task is not meant to be bound by the lifetime of the tenant in memory.
+    /// Thus the [`BackgroundPurges`] type to keep track of these tasks.
+    pub fn spawn(&self, tmp_path: Utf8PathBuf) {
+        // because on shutdown we close and wait, we are misusing TaskTracker a bit.
+        //
+        // so first acquire a token, then check if the tracker has been closed. the tracker might get closed
+        // right after, but at least the shutdown will wait for what we are spawning next.
+        let token = self.0.token();
+
+        if self.0.is_closed() {
+            warn!(
+                %tmp_path,
+                "trying to spawn background purge during shutdown, ignoring"
+            );
+            return;
+        }
+
+        let span = info_span!(parent: None, "background_purge", %tmp_path);
+
+        let task = move || {
+            let _token = token;
+            let _entered = span.entered();
+            if let Err(error) = std::fs::remove_dir_all(tmp_path.as_path()) {
+                // should we fatal_io_error here?
+                warn!(%error, "failed to purge tenant directory");
+            }
+        };
+
+        BACKGROUND_RUNTIME.spawn_blocking(task);
+    }
+
+    /// When this future completes, all background purges have completed.
+    /// The first poll of the future will already lock out new background purges spawned via [`Self::spawn`].
+    ///
+    /// Concurrent calls will coalesce.
+    ///
+    /// # Cancellation-Safety
+    ///
+    /// If this future is dropped before polled to completion, concurrent and subsequent
+    /// instances of this future will continue to be correct.
+    #[instrument(skip_all)]
+    pub async fn shutdown(&self) {
+        // forbid new tasks (can be called many times)
+        self.0.close();
+        self.0.wait().await;
+    }
 }
 
 static TENANTS: Lazy<std::sync::RwLock<TenantsMap>> =
@@ -269,10 +302,12 @@ pub struct TenantManager {
     // tenants have their own cancellation tokens, which we fire individually in [`Self::shutdown`], or
     // when the tenant detaches.
     cancel: CancellationToken,
+
+    background_purges: BackgroundPurges,
 }
 
 fn emergency_generations(
-    tenant_confs: &HashMap<TenantShardId, anyhow::Result<LocationConf>>,
+    tenant_confs: &HashMap<TenantShardId, Result<LocationConf, LoadConfigError>>,
 ) -> HashMap<TenantShardId, TenantStartupMode> {
     tenant_confs
         .iter()
@@ -296,7 +331,7 @@ fn emergency_generations(
 
 async fn init_load_generations(
     conf: &'static PageServerConf,
-    tenant_confs: &HashMap<TenantShardId, anyhow::Result<LocationConf>>,
+    tenant_confs: &HashMap<TenantShardId, Result<LocationConf, LoadConfigError>>,
     resources: &TenantSharedResources,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<HashMap<TenantShardId, TenantStartupMode>>> {
@@ -346,56 +381,32 @@ async fn init_load_generations(
 /// Given a directory discovered in the pageserver's tenants/ directory, attempt
 /// to load a tenant config from it.
 ///
-/// If file is missing, return Ok(None)
+/// If we cleaned up something expected (like an empty dir or a temp dir), return None.
 fn load_tenant_config(
     conf: &'static PageServerConf,
+    tenant_shard_id: TenantShardId,
     dentry: Utf8DirEntry,
-) -> anyhow::Result<Option<(TenantShardId, anyhow::Result<LocationConf>)>> {
+) -> Option<Result<LocationConf, LoadConfigError>> {
     let tenant_dir_path = dentry.path().to_path_buf();
     if crate::is_temporary(&tenant_dir_path) {
         info!("Found temporary tenant directory, removing: {tenant_dir_path}");
         // No need to use safe_remove_tenant_dir_all because this is already
         // a temporary path
-        if let Err(e) = std::fs::remove_dir_all(&tenant_dir_path) {
-            error!(
-                "Failed to remove temporary directory '{}': {:?}",
-                tenant_dir_path, e
-            );
-        }
-        return Ok(None);
+        std::fs::remove_dir_all(&tenant_dir_path).fatal_err("delete temporary tenant dir");
+        return None;
     }
 
     // This case happens if we crash during attachment before writing a config into the dir
     let is_empty = tenant_dir_path
         .is_empty_dir()
-        .with_context(|| format!("Failed to check whether {tenant_dir_path:?} is an empty dir"))?;
+        .fatal_err("Checking for empty tenant dir");
     if is_empty {
         info!("removing empty tenant directory {tenant_dir_path:?}");
-        if let Err(e) = std::fs::remove_dir(&tenant_dir_path) {
-            error!(
-                "Failed to remove empty tenant directory '{}': {e:#}",
-                tenant_dir_path
-            )
-        }
-        return Ok(None);
+        std::fs::remove_dir(&tenant_dir_path).fatal_err("delete empty tenant dir");
+        return None;
     }
 
-    let tenant_shard_id = match tenant_dir_path
-        .file_name()
-        .unwrap_or_default()
-        .parse::<TenantShardId>()
-    {
-        Ok(id) => id,
-        Err(_) => {
-            warn!("Invalid tenant path (garbage in our repo directory?): {tenant_dir_path}",);
-            return Ok(None);
-        }
-    };
-
-    Ok(Some((
-        tenant_shard_id,
-        Tenant::load_tenant_config(conf, &tenant_shard_id),
-    )))
+    Some(Tenant::load_tenant_config(conf, &tenant_shard_id))
 }
 
 /// Initial stage of load: walk the local tenants directory, clean up any temp files,
@@ -405,32 +416,51 @@ fn load_tenant_config(
 /// seconds even on reasonably fast drives.
 async fn init_load_tenant_configs(
     conf: &'static PageServerConf,
-) -> anyhow::Result<HashMap<TenantShardId, anyhow::Result<LocationConf>>> {
+) -> HashMap<TenantShardId, Result<LocationConf, LoadConfigError>> {
     let tenants_dir = conf.tenants_path();
 
-    let dentries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Utf8DirEntry>> {
-        let dir_entries = tenants_dir
-            .read_dir_utf8()
-            .with_context(|| format!("Failed to list tenants dir {tenants_dir:?}"))?;
+    let dentries = tokio::task::spawn_blocking(move || -> Vec<Utf8DirEntry> {
+        let context = format!("read tenants dir {tenants_dir}");
+        let dir_entries = tenants_dir.read_dir_utf8().fatal_err(&context);
 
-        Ok(dir_entries.collect::<Result<Vec<_>, std::io::Error>>()?)
+        dir_entries
+            .collect::<Result<Vec<_>, std::io::Error>>()
+            .fatal_err(&context)
     })
-    .await??;
+    .await
+    .expect("Config load task panicked");
 
     let mut configs = HashMap::new();
 
     let mut join_set = JoinSet::new();
     for dentry in dentries {
-        join_set.spawn_blocking(move || load_tenant_config(conf, dentry));
+        let tenant_shard_id = match dentry.file_name().parse::<TenantShardId>() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!(
+                    "Invalid tenant path (garbage in our repo directory?): '{}'",
+                    dentry.file_name()
+                );
+                continue;
+            }
+        };
+
+        join_set.spawn_blocking(move || {
+            (
+                tenant_shard_id,
+                load_tenant_config(conf, tenant_shard_id, dentry),
+            )
+        });
     }
 
     while let Some(r) = join_set.join_next().await {
-        if let Some((tenant_id, tenant_config)) = r?? {
-            configs.insert(tenant_id, tenant_config);
+        let (tenant_shard_id, tenant_config) = r.expect("Panic in config load task");
+        if let Some(tenant_config) = tenant_config {
+            configs.insert(tenant_shard_id, tenant_config);
         }
     }
 
-    Ok(configs)
+    configs
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -451,6 +481,7 @@ pub(crate) enum DeleteTenantError {
 #[instrument(skip_all)]
 pub async fn init_tenant_mgr(
     conf: &'static PageServerConf,
+    background_purges: BackgroundPurges,
     resources: TenantSharedResources,
     init_order: InitializationOrder,
     cancel: CancellationToken,
@@ -472,7 +503,7 @@ pub async fn init_tenant_mgr(
     );
 
     // Scan local filesystem for attached tenants
-    let tenant_configs = init_load_tenant_configs(conf).await?;
+    let tenant_configs = init_load_tenant_configs(conf).await;
 
     // Determine which tenants are to be secondary or attached, and in which generation
     let tenant_modes = init_load_generations(conf, &tenant_configs, &resources, &cancel).await?;
@@ -516,7 +547,7 @@ pub async fn init_tenant_mgr(
 
                     match safe_rename_tenant_dir(&tenant_dir_path).await {
                         Ok(tmp_path) => {
-                            spawn_background_purge(tmp_path);
+                            background_purges.spawn(tmp_path);
                         }
                         Err(e) => {
                             error!(tenant_id=%tenant_shard_id.tenant_id, shard_id=%tenant_shard_id.shard_slug(),
@@ -590,14 +621,14 @@ pub async fn init_tenant_mgr(
     );
     // For those shards that have live configurations, construct `Tenant` or `SecondaryTenant` objects and start them running
     for (tenant_shard_id, location_conf, config_write_result) in config_write_results {
-        // Errors writing configs are fatal
-        config_write_result?;
+        // Writing a config to local disk is foundational to startup up tenants: panic if we can't.
+        config_write_result.fatal_err("write tenant shard config file");
 
         let tenant_dir_path = conf.tenant_path(&tenant_shard_id);
         let shard_identity = location_conf.shard;
         let slot = match location_conf.mode {
-            LocationMode::Attached(attached_conf) => {
-                match tenant_spawn(
+            LocationMode::Attached(attached_conf) => TenantSlot::Attached(
+                tenant_spawn(
                     conf,
                     tenant_shard_id,
                     &tenant_dir_path,
@@ -607,14 +638,9 @@ pub async fn init_tenant_mgr(
                     Some(init_order.clone()),
                     SpawnMode::Lazy,
                     &ctx,
-                ) {
-                    Ok(tenant) => TenantSlot::Attached(tenant),
-                    Err(e) => {
-                        error!(tenant_id=%tenant_shard_id.tenant_id, shard_id=%tenant_shard_id.shard_slug(), "Failed to start tenant: {e:#}");
-                        continue;
-                    }
-                }
-            }
+                )
+                .expect("global shutdown during init_tenant_mgr cannot happen"),
+            ),
             LocationMode::Secondary(secondary_conf) => {
                 info!(
                     tenant_id = %tenant_shard_id.tenant_id,
@@ -646,11 +672,11 @@ pub async fn init_tenant_mgr(
         tenants: &TENANTS,
         resources,
         cancel: CancellationToken::new(),
+        background_purges,
     })
 }
 
-/// Wrapper for Tenant::spawn that checks invariants before running, and inserts
-/// a broken tenant in the map if Tenant::spawn fails.
+/// Wrapper for Tenant::spawn that checks invariants before running
 #[allow(clippy::too_many_arguments)]
 fn tenant_spawn(
     conf: &'static PageServerConf,
@@ -662,23 +688,18 @@ fn tenant_spawn(
     init_order: Option<InitializationOrder>,
     mode: SpawnMode,
     ctx: &RequestContext,
-) -> anyhow::Result<Arc<Tenant>> {
-    anyhow::ensure!(
-        tenant_path.is_dir(),
-        "Cannot load tenant from path {tenant_path:?}, it either does not exist or not a directory"
-    );
-    anyhow::ensure!(
-        !crate::is_temporary(tenant_path),
-        "Cannot load tenant from temporary path {tenant_path:?}"
-    );
-    anyhow::ensure!(
-        !tenant_path.is_empty_dir().with_context(|| {
-            format!("Failed to check whether {tenant_path:?} is an empty dir")
-        })?,
-        "Cannot load tenant from empty directory {tenant_path:?}"
-    );
+) -> Result<Arc<Tenant>, GlobalShutDown> {
+    // All these conditions should have been satisfied by our caller: the tenant dir exists, is a well formed
+    // path, and contains a configuration file.  Assertions that do synchronous I/O are limited to debug mode
+    // to avoid impacting prod runtime performance.
+    assert!(!crate::is_temporary(tenant_path));
+    debug_assert!(tenant_path.is_dir());
+    debug_assert!(conf
+        .tenant_location_config_path(&tenant_shard_id)
+        .try_exists()
+        .unwrap());
 
-    let tenant = Tenant::spawn(
+    Tenant::spawn(
         conf,
         tenant_shard_id,
         resources,
@@ -687,9 +708,7 @@ fn tenant_spawn(
         init_order,
         mode,
         ctx,
-    );
-
-    Ok(tenant)
+    )
 }
 
 async fn shutdown_all_tenants0(tenants: &std::sync::RwLock<TenantsMap>) {
@@ -840,8 +859,9 @@ pub(crate) enum UpsertLocationError {
     #[error("Failed to flush: {0}")]
     Flush(anyhow::Error),
 
+    /// This error variant is for unexpected situations (soft assertions) where the system is in an unexpected state.
     #[error("Internal error: {0}")]
-    Other(#[from] anyhow::Error),
+    InternalError(anyhow::Error),
 }
 
 impl TenantManager {
@@ -971,7 +991,8 @@ impl TenantManager {
         match fast_path_taken {
             Some(FastPathModified::Attached(tenant)) => {
                 Tenant::persist_tenant_config(self.conf, &tenant_shard_id, &new_location_config)
-                    .await?;
+                    .await
+                    .fatal_err("write tenant shard config");
 
                 // Transition to AttachedStale means we may well hold a valid generation
                 // still, and have been requested to go stale as part of a migration.  If
@@ -1001,7 +1022,8 @@ impl TenantManager {
             }
             Some(FastPathModified::Secondary(_secondary_tenant)) => {
                 Tenant::persist_tenant_config(self.conf, &tenant_shard_id, &new_location_config)
-                    .await?;
+                    .await
+                    .fatal_err("write tenant shard config");
 
                 return Ok(None);
             }
@@ -1067,7 +1089,7 @@ impl TenantManager {
             Some(TenantSlot::InProgress(_)) => {
                 // This should never happen: acquire_slot should error out
                 // if the contents of a slot were InProgress.
-                return Err(UpsertLocationError::Other(anyhow::anyhow!(
+                return Err(UpsertLocationError::InternalError(anyhow::anyhow!(
                     "Acquired an InProgress slot, this is a bug."
                 )));
             }
@@ -1086,12 +1108,14 @@ impl TenantManager {
         // Does not need to be fsync'd because local storage is just a cache.
         tokio::fs::create_dir_all(&timelines_path)
             .await
-            .with_context(|| format!("Creating {timelines_path}"))?;
+            .fatal_err("create timelines/ dir");
 
         // Before activating either secondary or attached mode, persist the
         // configuration, so that on restart we will re-attach (or re-start
         // secondary) on the tenant.
-        Tenant::persist_tenant_config(self.conf, &tenant_shard_id, &new_location_config).await?;
+        Tenant::persist_tenant_config(self.conf, &tenant_shard_id, &new_location_config)
+            .await
+            .fatal_err("write tenant shard config");
 
         let new_slot = match &new_location_config.mode {
             LocationMode::Secondary(secondary_config) => {
@@ -1110,13 +1134,15 @@ impl TenantManager {
                 // from upserts.  This enables creating generation-less tenants even though neon_local
                 // always uses generations when calling the location conf API.
                 let attached_conf = if cfg!(feature = "testing") {
-                    let mut conf = AttachedTenantConf::try_from(new_location_config)?;
+                    let mut conf = AttachedTenantConf::try_from(new_location_config)
+                        .map_err(UpsertLocationError::BadRequest)?;
                     if self.conf.control_plane_api.is_none() {
                         conf.location.generation = Generation::none();
                     }
                     conf
                 } else {
-                    AttachedTenantConf::try_from(new_location_config)?
+                    AttachedTenantConf::try_from(new_location_config)
+                        .map_err(UpsertLocationError::BadRequest)?
                 };
 
                 let tenant = tenant_spawn(
@@ -1129,7 +1155,10 @@ impl TenantManager {
                     None,
                     spawn_mode,
                     ctx,
-                )?;
+                )
+                .map_err(|_: GlobalShutDown| {
+                    UpsertLocationError::Unavailable(TenantMapError::ShuttingDown)
+                })?;
 
                 TenantSlot::Attached(tenant)
             }
@@ -1143,7 +1172,7 @@ impl TenantManager {
 
         match slot_guard.upsert(new_slot) {
             Err(TenantSlotUpsertError::InternalError(e)) => {
-                Err(UpsertLocationError::Other(anyhow::anyhow!(e)))
+                Err(UpsertLocationError::InternalError(anyhow::anyhow!(e)))
             }
             Err(TenantSlotUpsertError::MapState(e)) => Err(UpsertLocationError::Unavailable(e)),
             Err(TenantSlotUpsertError::ShuttingDown((new_slot, _completion))) => {
@@ -1321,33 +1350,32 @@ impl TenantManager {
         tenant_shard_id: TenantShardId,
     ) -> Result<(), DeleteTenantError> {
         let remote_path = remote_tenant_path(&tenant_shard_id);
-        let keys = match self
-            .resources
-            .remote_storage
-            .list(
-                Some(&remote_path),
-                remote_storage::ListingMode::NoDelimiter,
-                None,
-                &self.cancel,
-            )
-            .await
-        {
-            Ok(listing) => listing.keys,
-            Err(remote_storage::DownloadError::Cancelled) => {
-                return Err(DeleteTenantError::Cancelled)
-            }
-            Err(remote_storage::DownloadError::NotFound) => return Ok(()),
-            Err(other) => return Err(DeleteTenantError::Other(anyhow::anyhow!(other))),
-        };
+        let mut keys_stream = self.resources.remote_storage.list_streaming(
+            Some(&remote_path),
+            remote_storage::ListingMode::NoDelimiter,
+            None,
+            &self.cancel,
+        );
+        while let Some(chunk) = keys_stream.next().await {
+            let keys = match chunk {
+                Ok(listing) => listing.keys,
+                Err(remote_storage::DownloadError::Cancelled) => {
+                    return Err(DeleteTenantError::Cancelled)
+                }
+                Err(remote_storage::DownloadError::NotFound) => return Ok(()),
+                Err(other) => return Err(DeleteTenantError::Other(anyhow::anyhow!(other))),
+            };
 
-        if keys.is_empty() {
-            tracing::info!("Remote storage already deleted");
-        } else {
-            tracing::info!("Deleting {} keys from remote storage", keys.len());
-            self.resources
-                .remote_storage
-                .delete_objects(&keys, &self.cancel)
-                .await?;
+            if keys.is_empty() {
+                tracing::info!("Remote storage already deleted");
+            } else {
+                tracing::info!("Deleting {} keys from remote storage", keys.len());
+                let keys = keys.into_iter().map(|o| o.key).collect::<Vec<_>>();
+                self.resources
+                    .remote_storage
+                    .delete_objects(&keys, &self.cancel)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -1366,6 +1394,7 @@ impl TenantManager {
 
         async fn delete_local(
             conf: &PageServerConf,
+            background_purges: &BackgroundPurges,
             tenant_shard_id: &TenantShardId,
         ) -> anyhow::Result<()> {
             let local_tenant_directory = conf.tenant_path(tenant_shard_id);
@@ -1374,7 +1403,7 @@ impl TenantManager {
                 .with_context(|| {
                     format!("local tenant directory {local_tenant_directory:?} rename")
                 })?;
-            spawn_background_purge(tmp_dir);
+            background_purges.spawn(tmp_dir);
             Ok(())
         }
 
@@ -1392,12 +1421,12 @@ impl TenantManager {
                         barrier.wait().await;
                     }
                 }
-                delete_local(self.conf, &tenant_shard_id).await?;
+                delete_local(self.conf, &self.background_purges, &tenant_shard_id).await?;
             }
             Some(TenantSlot::Secondary(secondary_tenant)) => {
                 secondary_tenant.shutdown().await;
 
-                delete_local(self.conf, &tenant_shard_id).await?;
+                delete_local(self.conf, &self.background_purges, &tenant_shard_id).await?;
             }
             Some(TenantSlot::InProgress(_)) => unreachable!(),
             None => {}
@@ -1668,7 +1697,7 @@ impl TenantManager {
         let tmp_path = safe_rename_tenant_dir(&local_tenant_directory)
             .await
             .with_context(|| format!("local tenant directory {local_tenant_directory:?} rename"))?;
-        spawn_background_purge(tmp_path);
+        self.background_purges.spawn(tmp_path);
 
         fail::fail_point!("shard-split-pre-finish", |_| Err(anyhow::anyhow!(
             "failpoint"
@@ -1700,14 +1729,9 @@ impl TenantManager {
             let parent_timelines = timelines.keys().cloned().collect::<Vec<_>>();
             for timeline in timelines.values() {
                 tracing::info!(timeline_id=%timeline.timeline_id, "Loading list of layers to hardlink");
-                let timeline_layers = timeline
-                    .layers
-                    .read()
-                    .await
-                    .likely_resident_layers()
-                    .collect::<Vec<_>>();
+                let layers = timeline.layers.read().await;
 
-                for layer in timeline_layers {
+                for layer in layers.likely_resident_layers() {
                     let relative_path = layer
                         .local_path()
                         .strip_prefix(&parent_path)
@@ -1844,7 +1868,7 @@ impl TenantManager {
         let tmp_path = self
             .detach_tenant0(conf, tenant_shard_id, deletion_queue_client)
             .await?;
-        spawn_background_purge(tmp_path);
+        self.background_purges.spawn(tmp_path);
 
         Ok(())
     }
@@ -1904,7 +1928,8 @@ impl TenantManager {
         timeline_id: TimelineId,
         prepared: PreparedTimelineDetach,
         ctx: &RequestContext,
-    ) -> Result<Vec<TimelineId>, anyhow::Error> {
+    ) -> Result<HashSet<TimelineId>, anyhow::Error> {
+        // FIXME: this is unnecessary, slotguard already has these semantics
         struct RevertOnDropSlot(Option<SlotGuard>);
 
         impl Drop for RevertOnDropSlot {
@@ -2025,7 +2050,6 @@ impl TenantManager {
                     };
 
                     match selector {
-                        ShardSelector::First => return ShardResolveResult::Found(tenant.clone()),
                         ShardSelector::Zero if slot.0.shard_number == ShardNumber(0) => {
                             return ShardResolveResult::Found(tenant.clone())
                         }
@@ -2107,6 +2131,9 @@ pub(crate) enum GetActiveTenantError {
     /// never happen.
     #[error("Tenant is broken: {0}")]
     Broken(String),
+
+    #[error("reconnect to switch tenant id")]
+    SwitchedTenant,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2711,7 +2738,9 @@ mod tests {
         // Test that if an InProgress tenant is in the map during shutdown, the shutdown will gracefully
         // wait for it to complete before proceeding.
 
-        let h = TenantHarness::create("shutdown_awaits_in_progress_tenant").unwrap();
+        let h = TenantHarness::create("shutdown_awaits_in_progress_tenant")
+            .await
+            .unwrap();
         let (t, _ctx) = h.load().await;
 
         // harness loads it to active, which is forced and nothing is running on the tenant
