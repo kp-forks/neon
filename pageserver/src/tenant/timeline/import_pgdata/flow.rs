@@ -56,6 +56,7 @@ use crate::pgdatadir_mapping::{
 };
 use crate::task_mgr::TaskKind;
 use crate::tenant::storage_layer::{AsLayerDesc, ImageLayerWriter, Layer};
+use crate::tenant::timeline::layer_manager::LayerManagerLockHolder;
 
 pub async fn run(
     timeline: Arc<Timeline>,
@@ -100,6 +101,7 @@ async fn run_v1(
                         .unwrap(),
                     import_job_concurrency: base.import_job_concurrency,
                     import_job_checkpoint_threshold: base.import_job_checkpoint_threshold,
+                    import_job_max_byte_range_size: base.import_job_max_byte_range_size,
                 }
             }
             None => timeline.conf.timeline_import_config.clone(),
@@ -441,6 +443,7 @@ impl Plan {
 
         let mut last_completed_job_idx = start_after_job_idx.unwrap_or(0);
         let checkpoint_every: usize = import_config.import_job_checkpoint_threshold.into();
+        let max_byte_range_size: usize = import_config.import_job_max_byte_range_size.into();
 
         // Run import jobs concurrently up to the limit specified by the pageserver configuration.
         // Note that we process completed futures in the oreder of insertion. This will be the
@@ -456,7 +459,7 @@ impl Plan {
 
                     work.push_back(tokio::task::spawn(async move {
                         let _permit = permit;
-                        let res = job.run(job_timeline, &ctx).await;
+                        let res = job.run(job_timeline, max_byte_range_size, &ctx).await;
                         (job_idx, res)
                     }));
                 },
@@ -679,6 +682,7 @@ trait ImportTask {
     async fn doit(
         self,
         layer_writer: &mut ImageLayerWriter,
+        max_byte_range_size: usize,
         ctx: &RequestContext,
     ) -> anyhow::Result<usize>;
 }
@@ -715,6 +719,7 @@ impl ImportTask for ImportSingleKeyTask {
     async fn doit(
         self,
         layer_writer: &mut ImageLayerWriter,
+        _max_byte_range_size: usize,
         ctx: &RequestContext,
     ) -> anyhow::Result<usize> {
         layer_writer.put_image(self.key, self.buf, ctx).await?;
@@ -768,10 +773,9 @@ impl ImportTask for ImportRelBlocksTask {
     async fn doit(
         self,
         layer_writer: &mut ImageLayerWriter,
+        max_byte_range_size: usize,
         ctx: &RequestContext,
     ) -> anyhow::Result<usize> {
-        const MAX_BYTE_RANGE_SIZE: usize = 4 * 1024 * 1024;
-
         debug!("Importing relation file");
 
         let (rel_tag, start_blk) = self.key_range.start.to_rel_block()?;
@@ -796,7 +800,7 @@ impl ImportTask for ImportRelBlocksTask {
                 assert_eq!(key.len(), 1);
                 assert!(!acc.is_empty());
                 assert!(acc_end > acc_start);
-                if acc_end == start && end - acc_start <= MAX_BYTE_RANGE_SIZE {
+                if acc_end == start && end - acc_start <= max_byte_range_size {
                     acc.push(key.pop().unwrap());
                     Ok((acc, acc_start, end))
                 } else {
@@ -860,6 +864,7 @@ impl ImportTask for ImportSlruBlocksTask {
     async fn doit(
         self,
         layer_writer: &mut ImageLayerWriter,
+        _max_byte_range_size: usize,
         ctx: &RequestContext,
     ) -> anyhow::Result<usize> {
         debug!("Importing SLRU segment file {}", self.path);
@@ -906,12 +911,13 @@ impl ImportTask for AnyImportTask {
     async fn doit(
         self,
         layer_writer: &mut ImageLayerWriter,
+        max_byte_range_size: usize,
         ctx: &RequestContext,
     ) -> anyhow::Result<usize> {
         match self {
-            Self::SingleKey(t) => t.doit(layer_writer, ctx).await,
-            Self::RelBlocks(t) => t.doit(layer_writer, ctx).await,
-            Self::SlruBlocks(t) => t.doit(layer_writer, ctx).await,
+            Self::SingleKey(t) => t.doit(layer_writer, max_byte_range_size, ctx).await,
+            Self::RelBlocks(t) => t.doit(layer_writer, max_byte_range_size, ctx).await,
+            Self::SlruBlocks(t) => t.doit(layer_writer, max_byte_range_size, ctx).await,
         }
     }
 }
@@ -952,7 +958,12 @@ impl ChunkProcessingJob {
         }
     }
 
-    async fn run(self, timeline: Arc<Timeline>, ctx: &RequestContext) -> anyhow::Result<()> {
+    async fn run(
+        self,
+        timeline: Arc<Timeline>,
+        max_byte_range_size: usize,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<()> {
         let mut writer = ImageLayerWriter::new(
             timeline.conf,
             timeline.timeline_id,
@@ -967,14 +978,17 @@ impl ChunkProcessingJob {
 
         let mut nimages = 0;
         for task in self.tasks {
-            nimages += task.doit(&mut writer, ctx).await?;
+            nimages += task.doit(&mut writer, max_byte_range_size, ctx).await?;
         }
 
         let resident_layer = if nimages > 0 {
             let (desc, path) = writer.finish(ctx).await?;
 
             {
-                let guard = timeline.layers.read().await;
+                let guard = timeline
+                    .layers
+                    .read(LayerManagerLockHolder::ImportPgData)
+                    .await;
                 let existing_layer = guard.try_get_from_key(&desc.key());
                 if let Some(layer) = existing_layer {
                     if layer.metadata().generation == timeline.generation {
@@ -997,7 +1011,10 @@ impl ChunkProcessingJob {
         // certain that the existing layer is identical to the new one, so in that case
         // we replace the old layer with the one we just generated.
 
-        let mut guard = timeline.layers.write().await;
+        let mut guard = timeline
+            .layers
+            .write(LayerManagerLockHolder::ImportPgData)
+            .await;
 
         let existing_layer = guard
             .try_get_from_key(&resident_layer.layer_desc().key())
@@ -1026,7 +1043,7 @@ impl ChunkProcessingJob {
             }
         }
 
-        crate::tenant::timeline::drop_wlock(guard);
+        crate::tenant::timeline::drop_layer_manager_wlock(guard);
 
         timeline
             .remote_client
