@@ -753,6 +753,7 @@ dependencies = [
  "axum",
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "headers",
  "http 1.1.0",
@@ -761,6 +762,8 @@ dependencies = [
  "mime",
  "pin-project-lite",
  "serde",
+ "serde_html_form",
+ "serde_path_to_error",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
@@ -899,12 +902,6 @@ name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
-
-[[package]]
-name = "base64"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ea22880d78093b0cbe17c89f64a7d457941e65759157ec6cb31a31d652b05e5"
 
 [[package]]
 name = "base64"
@@ -1085,6 +1082,25 @@ name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
+
+[[package]]
+name = "cbindgen"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "975982cdb7ad6a142be15bdf84aea7ec6a9e5d4d797c004d43185b24cfe4e684"
+dependencies = [
+ "clap",
+ "heck",
+ "indexmap 2.9.0",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.100",
+ "tempfile",
+ "toml",
+]
 
 [[package]]
 name = "cc"
@@ -1271,6 +1287,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "communicator"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "neon-shmem",
+ "workspace_hack",
+]
+
+[[package]]
 name = "compute_api"
 version = "0.1.0"
 dependencies = [
@@ -1282,6 +1307,7 @@ dependencies = [
  "remote_storage",
  "serde",
  "serde_json",
+ "url",
  "utils",
 ]
 
@@ -1297,7 +1323,7 @@ dependencies = [
  "aws-smithy-types",
  "axum",
  "axum-extra",
- "base64 0.13.1",
+ "base64 0.22.1",
  "bytes",
  "camino",
  "cfg-if",
@@ -1307,6 +1333,7 @@ dependencies = [
  "fail",
  "flate2",
  "futures",
+ "hostname-validator",
  "http 1.1.0",
  "indexmap 2.9.0",
  "itertools 0.10.5",
@@ -1319,8 +1346,10 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "p256 0.13.2",
+ "pageserver_page_api",
  "postgres",
  "postgres_initdb",
+ "postgres_versioninfo",
  "regex",
  "remote_storage",
  "reqwest",
@@ -1337,6 +1366,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-stream",
  "tokio-util",
+ "tonic 0.13.1",
  "tower 0.5.2",
  "tower-http",
  "tower-otel",
@@ -1423,7 +1453,7 @@ name = "control_plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.13.1",
+ "base64 0.22.1",
  "camino",
  "clap",
  "comfy-table",
@@ -1445,6 +1475,7 @@ dependencies = [
  "regex",
  "reqwest",
  "safekeeper_api",
+ "safekeeper_client",
  "scopeguard",
  "serde",
  "serde_json",
@@ -2054,6 +2085,7 @@ dependencies = [
  "axum-extra",
  "camino",
  "camino-tempfile",
+ "clap",
  "futures",
  "http-body-util",
  "itertools 0.10.5",
@@ -2767,6 +2799,12 @@ dependencies = [
  "libc",
  "windows",
 ]
+
+[[package]]
+name = "hostname-validator"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f558a64ac9af88b5ba400d99b579451af0d39c6d360980045b91aac966d705e2"
 
 [[package]]
 name = "http"
@@ -4237,6 +4275,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "camino",
  "clap",
  "futures",
@@ -4255,6 +4294,7 @@ dependencies = [
  "tokio-util",
  "tonic 0.13.1",
  "tracing",
+ "url",
  "utils",
  "workspace_hack",
 ]
@@ -4334,6 +4374,7 @@ dependencies = [
  "postgres_backend",
  "postgres_connection",
  "postgres_ffi",
+ "postgres_ffi_types",
  "postgres_initdb",
  "posthog_client_lite",
  "pprof",
@@ -4403,7 +4444,9 @@ dependencies = [
  "nix 0.30.1",
  "once_cell",
  "postgres_backend",
- "postgres_ffi",
+ "postgres_ffi_types",
+ "postgres_versioninfo",
+ "posthog_client_lite",
  "rand 0.8.5",
  "remote_storage",
  "reqwest",
@@ -4414,6 +4457,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "thiserror 1.0.69",
+ "tracing",
  "tracing-utils",
  "utils",
 ]
@@ -4427,6 +4471,7 @@ dependencies = [
  "futures",
  "http-utils",
  "pageserver_api",
+ "postgres_versioninfo",
  "reqwest",
  "serde",
  "thiserror 1.0.69",
@@ -4465,11 +4510,18 @@ dependencies = [
 name = "pageserver_page_api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
+ "futures",
  "pageserver_api",
- "postgres_ffi",
+ "postgres_ffi_types",
  "prost 0.13.5",
+ "prost-types 0.13.5",
+ "strum",
+ "strum_macros",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
  "tonic 0.13.1",
  "tonic-build",
  "utils",
@@ -4812,7 +4864,7 @@ dependencies = [
 name = "postgres-protocol2"
 version = "0.1.0"
 dependencies = [
- "base64 0.20.0",
+ "base64 0.22.1",
  "byteorder",
  "bytes",
  "fallible-iterator",
@@ -4889,6 +4941,8 @@ dependencies = [
  "memoffset 0.9.0",
  "once_cell",
  "postgres",
+ "postgres_ffi_types",
+ "postgres_versioninfo",
  "pprof",
  "regex",
  "serde",
@@ -4898,13 +4952,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "postgres_ffi_types"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "workspace_hack",
+]
+
+[[package]]
 name = "postgres_initdb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
+ "postgres_versioninfo",
  "thiserror 1.0.69",
  "tokio",
+ "workspace_hack",
+]
+
+[[package]]
+name = "postgres_versioninfo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_repr",
+ "thiserror 1.0.69",
  "workspace_hack",
 ]
 
@@ -5120,7 +5194,7 @@ dependencies = [
  "petgraph",
  "prettyplease",
  "prost 0.13.5",
- "prost-types 0.13.3",
+ "prost-types 0.13.5",
  "regex",
  "syn 2.0.100",
  "tempfile",
@@ -5163,9 +5237,9 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
-version = "0.13.3"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4759aa0d3a6232fb8dbdb97b61de2c20047c68aca932c7ed76da9d788508d670"
+checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost 0.13.5",
 ]
@@ -5184,7 +5258,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-iam",
  "aws-sigv4",
- "base64 0.13.1",
+ "base64 0.22.1",
  "bstr",
  "bytes",
  "camino",
@@ -6099,6 +6173,7 @@ dependencies = [
  "postgres-protocol",
  "postgres_backend",
  "postgres_ffi",
+ "postgres_versioninfo",
  "pprof",
  "pq_proto",
  "rand 0.8.5",
@@ -6143,6 +6218,7 @@ dependencies = [
  "const_format",
  "pageserver_api",
  "postgres_ffi",
+ "postgres_versioninfo",
  "pq_proto",
  "serde",
  "serde_json",
@@ -6420,6 +6496,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_html_form"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d2de91cf02bbc07cde38891769ccd5d4f073d22a40683aa4bc7a95781aaa2c4"
+dependencies = [
+ "form_urlencoded",
+ "indexmap 2.9.0",
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.125"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6453,6 +6542,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_repr"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6475,15 +6575,17 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "2.3.3"
+version = "3.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07ff71d2c147a7b57362cead5e22f772cd52f6ab31cfcd9edcd7f6aeb2a0afbe"
+checksum = "d6b6f7f2fcb69f747921f79f3926bd1e203fce4fef62c268dd3abfb6d86029aa"
 dependencies = [
- "base64 0.13.1",
+ "base64 0.22.1",
  "chrono",
  "hex",
  "indexmap 1.9.3",
+ "indexmap 2.9.0",
  "serde",
+ "serde_derive",
  "serde_json",
  "serde_with_macros",
  "time",
@@ -6491,9 +6593,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "2.3.3"
+version = "3.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881b6f881b17d13214e5d494c939ebab463d01264ce1811e9d4ac3a882e7695f"
+checksum = "8d00caa5193a3c8362ac2b73be6b9e768aa5a4b2f721d8f4b339600c3cb51f8e"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -6744,6 +6846,7 @@ dependencies = [
  "chrono",
  "clap",
  "clashmap",
+ "compute_api",
  "control_plane",
  "cron",
  "diesel",
@@ -6755,6 +6858,7 @@ dependencies = [
  "hex",
  "http-utils",
  "humantime",
+ "humantime-serde",
  "hyper 0.14.30",
  "itertools 0.10.5",
  "json-structural-diff",
@@ -6765,6 +6869,7 @@ dependencies = [
  "pageserver_api",
  "pageserver_client",
  "postgres_connection",
+ "posthog_client_lite",
  "rand 0.8.5",
  "regex",
  "reqwest",
@@ -7543,6 +7648,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2 0.4.4",
  "http 1.1.0",
  "http-body 1.0.0",
@@ -7562,6 +7668,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -7573,7 +7680,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost-build 0.13.3",
- "prost-types 0.13.3",
+ "prost-types 0.13.5",
  "quote",
  "syn 2.0.100",
 ]
@@ -7585,7 +7692,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9687bd5bfeafebdded2356950f278bba8226f0b32109537c4253406e09aafe1"
 dependencies = [
  "prost 0.13.5",
- "prost-types 0.13.3",
+ "prost-types 0.13.5",
  "tokio",
  "tokio-stream",
  "tonic 0.13.1",
@@ -8141,6 +8248,7 @@ dependencies = [
  "futures",
  "pageserver_api",
  "postgres_ffi",
+ "postgres_ffi_types",
  "pprof",
  "prost 0.13.5",
  "remote_storage",
@@ -8564,7 +8672,6 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-core",
- "base64 0.13.1",
  "base64 0.21.7",
  "base64ct",
  "bytes",
